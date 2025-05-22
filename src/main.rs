@@ -24,6 +24,10 @@ use directories::ProjectDirs;
 // Need non-blocking queued IO for small files, but is not available in rust.
 const READ_BUFFER_SIZE: usize = 128 * 1024;
 
+// The Win32 limit is 32767 characters (https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation)
+// Leave 2k characters for whatever else is in the command line.
+const ARGUMENT_LENGTH_MAX: usize = 32767 - 2048;
+
 #[derive(Parser, Debug)]
 #[command(version = "0.1.1")]
 struct Options {
@@ -456,7 +460,7 @@ async fn run_p4_command_batched(
     for arg in batched_args {
         let arg_size = arg.len();
 
-        if batch_size + arg_size > 32000 {
+        if batch_size + arg_size > ARGUMENT_LENGTH_MAX {
             futures.push(task::spawn(run_p4_command_slice(
                 &unsafe_static_options,
                 &unsafe_static_work_dir,
