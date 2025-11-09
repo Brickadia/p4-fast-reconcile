@@ -1549,7 +1549,11 @@ fn main() -> Result<()> {
             }
         }
         // Correct the path since P4V tends to give us a bad one
-        let mut path = path.trim_end_matches("\\...").to_owned();
+        if cfg!(windows) {
+            path = path.trim_end_matches("\\...").to_owned();
+        } else if cfg!(unix) {
+            path = path.trim_end_matches("/...").to_owned();
+        }
         if let Some(first_letter) = path.get_mut(0..1) {
             first_letter.make_ascii_uppercase();
         }
