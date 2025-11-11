@@ -11,7 +11,7 @@ use async_global_executor as task;
 use clap::Parser;
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
-use futures::{future::join_all, join};
+use futures::future::join_all;
 use hex::FromHex;
 use humansize::{format_size, BINARY};
 use md5::{Digest, Md5};
@@ -27,6 +27,147 @@ const READ_BUFFER_SIZE: usize = 128 * 1024;
 // The Win32 limit is 32767 characters (https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/command-line-string-limitation)
 // Leave 2k characters for whatever else is in the command line.
 const ARGUMENT_LENGTH_MAX: usize = 32767 - 2048;
+
+// Python marshal format type codes
+const TYPE_NULL: u8 = b'0';
+const TYPE_DICT: u8 = b'{';
+const TYPE_STRING: u8 = b's';
+
+/// Record from `p4 -G have` output
+#[derive(Debug, Clone)]
+struct HaveRecord {
+    sync_time: Option<u64>,   // Unix timestamp (optional)
+}
+
+/// Read one string from Python marshal format
+/// Format: 's' (type byte) + 4-byte little-endian i32 (length) + N bytes (data)
+fn read_marshal_string(cursor: &mut &[u8]) -> Result<Vec<u8>> {
+    if cursor.is_empty() {
+        bail!("Unexpected EOF reading marshal string type");
+    }
+
+    let type_byte = cursor[0];
+    if type_byte != TYPE_STRING {
+        bail!("Expected string type 's' (0x73), got 0x{:02x}", type_byte);
+    }
+    *cursor = &cursor[1..];
+
+    if cursor.len() < 4 {
+        bail!("Unexpected EOF reading marshal string length");
+    }
+
+    let length = i32::from_le_bytes([cursor[0], cursor[1], cursor[2], cursor[3]]) as usize;
+    *cursor = &cursor[4..];
+
+    if cursor.len() < length {
+        bail!("Unexpected EOF reading marshal string data (expected {} bytes, got {})", length, cursor.len());
+    }
+
+    let data = cursor[..length].to_vec();
+    *cursor = &cursor[length..];
+
+    Ok(data)
+}
+
+/// Read one dictionary from Python marshal format
+/// Format: '{' (type byte) + (key string + value string)* + '0' (null terminator)
+fn read_marshal_dict(cursor: &mut &[u8]) -> Result<HashMap<Vec<u8>, Vec<u8>>> {
+    if cursor.is_empty() {
+        bail!("Unexpected EOF reading marshal dict type");
+    }
+
+    let type_byte = cursor[0];
+    if type_byte != TYPE_DICT {
+        bail!("Expected dict type '{{' (0x7b), got 0x{:02x}", type_byte);
+    }
+    *cursor = &cursor[1..];
+
+    let mut dict = HashMap::new();
+
+    loop {
+        if cursor.is_empty() {
+            bail!("Unexpected EOF reading marshal dict (missing terminator)");
+        }
+
+        // Check for dict terminator
+        if cursor[0] == TYPE_NULL {
+            *cursor = &cursor[1..];
+            break;
+        }
+
+        // Read key-value pair
+        let key = read_marshal_string(cursor)?;
+        let value = read_marshal_string(cursor)?;
+        dict.insert(key, value);
+    }
+
+    Ok(dict)
+}
+
+/// Parse all records from `p4 -G have` output
+fn parse_p4_have_output(data: &[u8]) -> Result<HashMap<String, HaveRecord>> {
+    let mut cursor = data;
+    let mut have_records = HashMap::new();
+    let mut total_parsed = 0;
+    let mut missing_synctime = 0;
+
+    while !cursor.is_empty() {
+        // Parse one dictionary
+        let dict = match read_marshal_dict(&mut cursor) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Warning: Failed to parse marshal dict at record {}: {}", total_parsed + 1, e);
+                break;
+            }
+        };
+
+        total_parsed = total_parsed + 1;
+
+        let code = dict.get(b"code".as_ref())
+            .and_then(|v| String::from_utf8(v.clone()).ok());
+
+        // Skip non-stat records (errors, info messages)
+        if code.as_deref() != Some("stat") {
+            continue;
+        }
+
+        let path = dict.get(b"path".as_ref())
+            .ok_or_else(|| anyhow!("Record missing 'path' field"))?;
+
+        let sync_time = dict.get(b"syncTime".as_ref());
+
+        // Decode Windows-1252 paths to UTF-8
+        let (path_str, _, had_errors) = WINDOWS_1252.decode(path);
+        if had_errors {
+            eprintln!("Warning: Path decoding error for record {}", total_parsed);
+        }
+
+        let sync_time_num = if let Some(st) = sync_time {
+            let st_str = String::from_utf8_lossy(st);
+            match st_str.parse::<u64>() {
+                Ok(num) => Some(num),
+                Err(e) => {
+                    eprintln!("Warning: Failed to parse syncTime '{}': {}", st_str, e);
+                    None
+                }
+            }
+        } else {
+            missing_synctime = missing_synctime + 1;
+            None
+        };
+
+        // Store with lowercase path for case-insensitive matching on Windows
+        let path_lower = path_str.to_lowercase();
+
+        have_records.insert(path_lower, HaveRecord {
+            sync_time: sync_time_num,
+        });
+    }
+
+    println!("      Parsed {} have records ({} missing syncTime).", total_parsed, missing_synctime);
+
+    Ok(have_records)
+}
 
 #[derive(Parser, Debug)]
 #[command(version = "0.1.2")]
@@ -383,6 +524,44 @@ impl WorkspaceState {
             None => None,
         }
     }
+}
+
+/// Run `p4 -G have` and parse the binary marshal output to get sync timestamps
+async fn run_p4_have(options: &Options, work_dir: &str) -> Result<HashMap<String, HaveRecord>> {
+    println!("   Querying file sync timestamps.");
+    let start_time = Instant::now();
+
+    let mut cmd = Command::new("p4");
+    cmd.current_dir(work_dir);
+
+    if options.workspace.is_some() {
+        cmd.arg("-c");
+        cmd.arg(&options.workspace.as_ref().unwrap());
+    }
+
+    cmd.arg("-G");
+    cmd.arg("have");
+    cmd.arg("...");
+
+    if options.verbose {
+        println!("    Running: p4 -G have ...");
+    }
+
+    let output = cmd.output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("p4 -G have failed: {}", stderr);
+    }
+
+    let records = parse_p4_have_output(&output.stdout)?;
+
+    println!(
+        "      Query complete in {} seconds.",
+        start_time.elapsed().as_secs_f32()
+    );
+
+    Ok(records)
 }
 
 /// Runs one slice of a batched p4 command (eg. p4 stuff a100 a101 ... a198 a199)
@@ -837,6 +1016,22 @@ fn compute_digest_utf8(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
     update_text_digest_utf8(&mut filled, &mut line_buffer, hasher)
 }
 
+/// Check if a file is unchanged since last sync
+fn is_unchanged_since_sync(file: &WorkspaceFile, have_records: &HashMap<String, HaveRecord>) -> bool {
+    if let Some(have_rec) = have_records.get(&file.path_lower) {
+        if let Some(sync_time) = have_rec.sync_time {
+            // Truncate to second precision (Perforce uses seconds, SystemTime has nanos)
+            let file_time_secs = match file.date.duration_since(UNIX_EPOCH) {
+                Ok(duration) => duration.as_secs(),
+                Err(_) => return false,
+            };
+
+            return file_time_secs <= sync_time;
+        }
+    }
+    false
+}
+
 /// Computes digests for a number of files in the workspace.
 fn parallel_compute_digests<'a>(
     files: Vec<(&'a WorkspaceFile, DigestType)>,
@@ -896,13 +1091,15 @@ fn parallel_compute_digests<'a>(
 async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceCache) -> Result<()> {
     println!("Processing path \"{}\".", work_dir);
 
-    let (maybe_depot, maybe_workspace) = join!(
+    let (maybe_depot, maybe_workspace, maybe_have) = futures::join!(
         run_p4_fstat_all(&options, &work_dir),
-        gather_workspace(&options, work_dir)
+        gather_workspace(&options, work_dir),
+        run_p4_have(&options, &work_dir)
     );
 
     let depot: DepotState = maybe_depot?;
     let workspace: WorkspaceState = maybe_workspace?;
+    let have_records: HashMap<String, HaveRecord> = maybe_have?;
 
     if depot.file_records.len() == 0 && workspace.num_files == 0 {
         println!("The folder contains no files that need checking.");
@@ -1140,14 +1337,89 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
         start_time.elapsed().as_secs_f32()
     );
 
+    // Track timestamp optimization stats
+    let mut total_skipped = 0;
+    let mut total_candidates = 0;
+
+    // Filter files using timestamp optimization
+    let check_edit_filtered = if !check_edit.is_empty() {
+        let original_count = check_edit.len();
+        total_candidates += original_count;
+
+        let (unchanged, needs_digest): (Vec<_>, Vec<_>) = check_edit.into_iter()
+            .partition(|(file, _)| is_unchanged_since_sync(file, &have_records));
+
+        total_skipped += unchanged.len();
+
+        if unchanged.len() > 0 && options.verbose {
+            println!("   Skipped {} file(s) unchanged since sync (check_edit).", unchanged.len());
+        }
+
+        needs_digest
+    } else {
+        Vec::new()
+    };
+
+    let (check_revert_edit_filtered, check_revert_edit_reverted) = if !check_revert_edit.is_empty() {
+        let original_count = check_revert_edit.len();
+        total_candidates += original_count;
+
+        let (unchanged, needs_digest): (Vec<_>, Vec<_>) = check_revert_edit.into_iter()
+            .partition(|(file, _)| is_unchanged_since_sync(file, &have_records));
+
+        total_skipped += unchanged.len();
+
+        if unchanged.len() > 0 && options.verbose {
+            println!("   Skipped {} file(s) unchanged since sync (check_revert_edit).", unchanged.len());
+        }
+
+        (needs_digest, unchanged)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let (check_revert_delete_filtered, check_revert_delete_reverted) = if !check_revert_delete_or_reopen_edit.is_empty() {
+        let original_count = check_revert_delete_or_reopen_edit.len();
+        total_candidates += original_count;
+
+        let (unchanged, needs_digest): (Vec<_>, Vec<_>) = check_revert_delete_or_reopen_edit.into_iter()
+            .partition(|(file, _)| is_unchanged_since_sync(file, &have_records));
+
+        total_skipped += unchanged.len();
+
+        if unchanged.len() > 0 && options.verbose {
+            println!("   Skipped {} file(s) unchanged since sync (check_revert_delete).", unchanged.len());
+        }
+
+        (needs_digest, unchanged)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    if total_skipped > 0 {
+        let percentage = if total_candidates > 0 {
+            (total_skipped * 100) / total_candidates
+        } else {
+            0
+        };
+        println!(
+            "   Timestamp optimization: Skipped {} of {} digest computations ({}%).",
+            total_skipped,
+            total_candidates,
+            percentage
+        );
+    }
+
+    // Phase 2: Compute digests for files that need checking
+
     // Compute digests to see if we need to open files for edit.
-    if !check_edit.is_empty() {
-        println!("   Checking digests for {} files.", check_edit.len());
+    if !check_edit_filtered.is_empty() {
+        println!("   Checking digests for {} files.", check_edit_filtered.len());
 
         let start_time = Instant::now();
         let mut total_size = 0;
 
-        let results = parallel_compute_digests(check_edit, cache)?;
+        let results = parallel_compute_digests(check_edit_filtered, cache)?;
         for result in results {
             if !result.2 {
                 total_size += result.0.size;
@@ -1176,16 +1448,24 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Compute digests to see if we need to revert files open for edit.
-    if !check_revert_edit.is_empty() {
+    // First add the files we already know are unchanged
+    for (file, _) in check_revert_edit_reverted {
+        do_revert_edit.push(file.path.clone());
+        if options.verbose {
+            println!("         File \"{}\" unchanged since sync (revert).", &file.path);
+        }
+    }
+
+    if !check_revert_edit_filtered.is_empty() {
         println!(
             "   Checking digests for {} files.",
-            check_revert_edit.len()
+            check_revert_edit_filtered.len()
         );
 
         let start_time = Instant::now();
         let mut total_size = 0;
 
-        let results = parallel_compute_digests(check_revert_edit, cache)?;
+        let results = parallel_compute_digests(check_revert_edit_filtered, cache)?;
         for result in results {
             if !result.2 {
                 total_size += result.0.size;
@@ -1214,16 +1494,24 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Compute digests to see if we need to revert deletes or reopen files for edit.
-    if !check_revert_delete_or_reopen_edit.is_empty() {
+    // First add the files we already know are unchanged (revert delete)
+    for (file, _) in check_revert_delete_reverted {
+        do_revert_delete.push(file.path.clone());
+        if options.verbose {
+            println!("         File \"{}\" unchanged since sync (revert delete).", &file.path);
+        }
+    }
+
+    if !check_revert_delete_filtered.is_empty() {
         println!(
             "   Checking digests for {} files.",
-            check_revert_delete_or_reopen_edit.len()
+            check_revert_delete_filtered.len()
         );
 
         let start_time = Instant::now();
         let mut total_size = 0;
 
-        let results = parallel_compute_digests(check_revert_delete_or_reopen_edit, cache)?;
+        let results = parallel_compute_digests(check_revert_delete_filtered, cache)?;
         for result in results {
             if !result.2 {
                 total_size += result.0.size;
@@ -1594,3 +1882,4 @@ fn main() -> Result<()> {
     );
     Ok(())
 }
+
