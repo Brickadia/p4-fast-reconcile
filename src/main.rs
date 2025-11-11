@@ -7,7 +7,7 @@ use std::{env, io};
 
 use anyhow::{anyhow, bail, Error, Result};
 use async_process::Command;
-use async_std::task;
+use smol as task;
 use clap::Parser;
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
@@ -29,7 +29,7 @@ const READ_BUFFER_SIZE: usize = 128 * 1024;
 const ARGUMENT_LENGTH_MAX: usize = 32767 - 2048;
 
 #[derive(Parser, Debug)]
-#[command(version = "0.1.1")]
+#[command(version = "0.1.2")]
 struct Options {
     /// The workspace to use. If not set, will try to use P4CLIENT. If that is also not set, will try the default one.
     #[arg(short, long)]

@@ -1,22 +1,25 @@
 [package]
 name = "p4-fast-reconcile"
-version = "0.1.1"
-edition = "2021"
+version = "0.1.2"
+edition = "2024"
 authors = ["Brickadia, LLC"]
 
 [dependencies]
-anyhow = { version = "1.0.78", features = ["backtrace"] }
-clap = { version = "4.4.12", features = ["derive"] }
-walkdir = "2.4.0"
-md-5 = "0.10.6"
-rayon = "1.8.0"
-async-std = "1.12.0"
-async-process = "2.0.1"
-futures = "0.3.30"
+anyhow = { version = "1.0.100", features = ["backtrace"] }
+clap = { version = "4.5.51", features = ["derive"] }
+walkdir = "2.5.0"
+md-5 = "0.11.0-rc.3"
+rayon = "1.11.0"
+smol = "2.0"
+async-process = "2.5.0"
+futures = "0.3.31"
 hex = "0.4.3"
-encoding_rs = "0.8.33"
+encoding_rs = "0.8.35"
 encoding_rs_io = "0.1.7"
 humansize = "2.1.3"
-bincode = "2.0.0-rc.3"
-directories = "5.0.1"
-serde_json = "1.0"
+bincode = "2.0.1"
+directories = "6.0.0"
+serde_json = "1.0.145"
+
+[build-dependencies]
+embed-resource = "2.5"
