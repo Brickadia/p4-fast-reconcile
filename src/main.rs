@@ -7,7 +7,7 @@ use std::{env, io};
 
 use anyhow::{anyhow, bail, Error, Result};
 use async_process::Command;
-use smol as task;
+use async_global_executor as task;
 use clap::Parser;
 use encoding_rs::WINDOWS_1252;
 use encoding_rs_io::DecodeReaderBytesBuilder;
@@ -221,7 +221,24 @@ impl DepotState {
 
         for (i, record) in self.file_records.iter().enumerate() {
             self.depot_map.insert(record.depot_file_lower.clone(), i);
-            self.client_map.insert(record.client_file_lower.clone(), i);
+
+            // Handle case-sensitivity collisions on Windows (e.g., Snow_Normal.uasset vs Snow_normal.uasset)
+            // If there's already an entry, prefer the non-deleted one with haveRev
+            if let Some(&existing_idx) = self.client_map.get(&record.client_file_lower) {
+                let existing = &self.file_records[existing_idx];
+                let existing_is_deleted = matches!(existing.head_action, Some(FileAction::Delete | FileAction::MoveDelete));
+                let current_is_deleted = matches!(record.head_action, Some(FileAction::Delete | FileAction::MoveDelete));
+
+                // Prefer non-deleted over deleted, or the one with haveRev
+                let should_replace = (!current_is_deleted && existing_is_deleted)
+                    || (current_is_deleted == existing_is_deleted && record.have_rev.is_some() && existing.have_rev.is_none());
+
+                if should_replace {
+                    self.client_map.insert(record.client_file_lower.clone(), i);
+                }
+            } else {
+                self.client_map.insert(record.client_file_lower.clone(), i);
+            }
         }
     }
 
@@ -230,17 +247,11 @@ impl DepotState {
     }
 
     pub fn get_depot_record(&self, file: &str) -> Option<&DepotFileRecord> {
-        match self.depot_map.get(file) {
-            Some(i) => Some(&self.file_records[*i]),
-            None => None,
-        }
+        self.depot_map.get(file).map(|&i| &self.file_records[i])
     }
 
     pub fn get_depot_record_mut(&mut self, file: &str) -> Option<&mut DepotFileRecord> {
-        match self.depot_map.get(file) {
-            Some(i) => Some(&mut self.file_records[*i]),
-            None => None,
-        }
+        self.depot_map.get(file).map(|&i| &mut self.file_records[i])
     }
 
     pub fn has_client_record(&self, file: &str) -> bool {
@@ -248,17 +259,11 @@ impl DepotState {
     }
 
     pub fn get_client_record(&self, file: &str) -> Option<&DepotFileRecord> {
-        match self.client_map.get(file) {
-            Some(i) => Some(&self.file_records[*i]),
-            None => None,
-        }
+        self.client_map.get(file).map(|&i| &self.file_records[i])
     }
 
     pub fn get_client_record_mut(&mut self, file: &str) -> Option<&mut DepotFileRecord> {
-        match self.client_map.get(file) {
-            Some(i) => Some(&mut self.file_records[*i]),
-            None => None,
-        }
+        self.client_map.get(file).map(|&i| &mut self.file_records[i])
     }
 }
 
@@ -362,10 +367,7 @@ impl WorkspaceState {
     }
 
     pub fn get_file(&self, file: &str) -> Option<&WorkspaceFile> {
-        match self.file_map.get(file) {
-            Some(i) => Some(&self.files[*i]),
-            None => None,
-        }
+        self.file_map.get(file).map(|&i| &self.files[i])
     }
 
     pub fn get_filtered(&self, file: &str) -> Option<&WorkspaceFile> {
@@ -469,14 +471,14 @@ async fn run_p4_command_batched(
                 use_changelist,
             )));
 
-            batch_count = batch_count + 1;
+            batch_count += 1;
 
             batch_start = batch_end;
             batch_size = 0;
         }
 
-        batch_size = batch_size + arg_size + 1;
-        batch_end = batch_end + 1;
+        batch_size += arg_size + 1;
+        batch_end += 1;
     }
 
     // Start final, less full batch
@@ -489,7 +491,7 @@ async fn run_p4_command_batched(
             use_changelist,
         )));
 
-        batch_count = batch_count + 1;
+        batch_count += 1;
     }
 
     println!("      Running \"p4 {}\" with {} batches.", always_args[0], batch_count);
@@ -508,7 +510,7 @@ async fn run_p4_command_batched(
     Ok(results)
 }
 
-async fn parse_p4_fstat_response(output: Vec<String>) -> Result<Vec<DepotFileRecord>> {
+fn parse_p4_fstat_response(output: Vec<String>) -> Result<Vec<DepotFileRecord>> {
     let mut records: Vec<DepotFileRecord> = Vec::new();
     let mut pending_record: DepotFileRecord = Default::default();
 
@@ -577,7 +579,7 @@ async fn run_p4_fstat_all(options: &Options, work_dir: &str) -> Result<DepotStat
     }
 
     let mut depot_state: DepotState = Default::default();
-    depot_state.file_records = parse_p4_fstat_response(response).await?;
+    depot_state.file_records = parse_p4_fstat_response(response)?;
 
     // Build hashmaps to find records
     depot_state.build_mapping();
@@ -615,7 +617,7 @@ async fn run_p4_fstat_all(options: &Options, work_dir: &str) -> Result<DepotStat
     );
 
     // Request new records for them and update the digests
-    if old_records.len() > 0 {
+    if !old_records.is_empty() {
         println!(
             "   Requesting depot state for {} outdated files.",
             old_records.len()
@@ -634,7 +636,7 @@ async fn run_p4_fstat_all(options: &Options, work_dir: &str) -> Result<DepotStat
             println!("         END FSTAT RESPONSE DUMP");
         }
 
-        let refreshed_records = parse_p4_fstat_response(response).await?;
+        let refreshed_records = parse_p4_fstat_response(response)?;
 
         for refreshed_record in &refreshed_records {
             match depot_state.get_depot_record_mut(&refreshed_record.depot_file_lower) {
@@ -686,7 +688,7 @@ async fn gather_workspace(options: &Options, work_dir: &str) -> Result<Workspace
                 if path.file_type().is_file() {
                     let path_string = path.path().display().to_string();
                     let meta = path.metadata()?;
-                    total_size = total_size + meta.len();
+                    total_size += meta.len();
 
                     workspace_state.files.push(WorkspaceFile {
                         path_lower: path_string.to_ascii_lowercase(),
@@ -696,7 +698,7 @@ async fn gather_workspace(options: &Options, work_dir: &str) -> Result<Workspace
                         filtered: false,
                     });
                 } else if path.file_type().is_dir() {
-                    num_dirs = num_dirs + 1;
+                    num_dirs += 1;
                 }
             }
             Err(e) => return Err(e.into()),
@@ -743,51 +745,18 @@ async fn gather_workspace(options: &Options, work_dir: &str) -> Result<Workspace
     let mut ignored_files_hash: HashSet<String> = HashSet::new();
 
     for file in ignored_files {
-        ignored_files_hash.insert(file[..file.len() - 8].to_string());
+        // p4 ignores -i returns files with " ignored" suffix (8 chars including leading space)
+        if file.len() >= 8 {
+            ignored_files_hash.insert(file[..file.len() - 8].to_string());
+        }
     }
 
     for file in workspace_state.files.iter_mut() {
         if ignored_files_hash.contains(&file.path) {
-            ignored_count = ignored_count + 1;
+            ignored_count += 1;
             file.filtered = true;
         }
     }
-
-    // TODO: Not needed? Same count with it disabled, what was this for?
-    /*
-    // Filter by p4 where
-    let where_args = ["-F", "%mapFlag%%localPath%", "where"];
-    let where_paths = workspace_state
-        .files
-        .iter()
-        .filter(|f| !f.filtered)
-        .map(|f| f.path.clone())
-        .collect::<Vec<_>>();
-
-    let where_files: Vec<String> =
-        run_p4_command_batched(&options, &work_dir, &where_args, &where_paths, false).await?;
-
-    let mut where_files_hash: HashSet<String> = HashSet::new();
-
-    for file in where_files {
-        if file.starts_with("-") {
-            where_files_hash.insert(file[1..].to_string());
-
-            if options.verbose {
-                println!("         Ignored file \"{}\" by where", file);
-            }
-        } else {
-            where_files_hash.remove(&file);
-        }
-    }
-
-    for file in workspace_state.files.iter_mut() {
-        if !file.filtered && where_files_hash.contains(&file.path) {
-            ignored_count = ignored_count + 1;
-            file.filtered = true;
-        }
-    }
-    */
 
     // Build hashmap
     workspace_state.build_mapping();
@@ -805,7 +774,7 @@ async fn gather_workspace(options: &Options, work_dir: &str) -> Result<Workspace
 
 /// Computes the digest for a binary file, simple MD5.
 fn compute_digest_binary(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
-    let mut file = File::open(&file.path).expect("Failed to open file for hash.");
+    let mut file = File::open(&file.path)?;
     let mut buffer = [0; READ_BUFFER_SIZE];
 
     loop {
@@ -829,6 +798,7 @@ fn update_text_digest_utf8<R: BufRead + Read>(
             Ok(0) => return Ok(()),
             Ok(_n) => {
                 if line_buffer.ends_with(b"\r\n") {
+                    // Remove only the \r, keeping the \n (Perforce normalizes CRLF -> LF)
                     line_buffer.remove(line_buffer.len() - 2);
                 }
                 md5::digest::Update::update(hasher, &line_buffer);
@@ -841,7 +811,7 @@ fn update_text_digest_utf8<R: BufRead + Read>(
 
 /// Computes the digest for a text file, normalized line endings MD5.
 fn compute_digest_text(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
-    let file = File::open(&file.path).expect("Failed to open file for hash.");
+    let file = File::open(&file.path)?;
     let mut read = BufReader::with_capacity(READ_BUFFER_SIZE, file);
     let mut line_buffer = Vec::new();
 
@@ -851,7 +821,7 @@ fn compute_digest_text(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
 /// Computes the digest for a utf8 file, normalized line endings MD5 without BOM.
 /// This function is a bit slower, but only few files have this encoding, so it is fine.
 fn compute_digest_utf8(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
-    let file = File::open(&file.path).expect("Failed to open file for hash.");
+    let file = File::open(&file.path)?;
     let mut buffer = [0u8; READ_BUFFER_SIZE];
     let mut line_buffer = Vec::new();
     let mut full_buffer = Vec::new();
@@ -871,36 +841,38 @@ fn compute_digest_utf8(file: &WorkspaceFile, hasher: &mut Md5) -> Result<()> {
 fn parallel_compute_digests<'a>(
     files: Vec<(&'a WorkspaceFile, DigestType)>,
     cache: &mut WorkspaceCache,
-) -> Vec<(&'a WorkspaceFile, [u8; 16], bool)> {
-    let results : Vec<(&'a WorkspaceFile, [u8; 16], bool)> = files
+) -> Result<Vec<(&'a WorkspaceFile, [u8; 16], bool)>> {
+    let results : Result<Vec<(&'a WorkspaceFile, [u8; 16], bool)>> = files
         .into_par_iter()
         .with_max_len(1)
-        .map(|file| {
+        .map(|file| -> Result<(&'a WorkspaceFile, [u8; 16], bool)> {
             // Check cache first
             if let Some(cache_entry) = cache.file_map.get(&file.0.path_lower) {
                 if cache_entry.size == file.0.size && cache_entry.date == file.0.date {
-                    return (file.0, cache_entry.digest, true);
+                    return Ok((file.0, cache_entry.digest, true));
                 }
             }
 
             let mut hasher = Md5::new();
             let mut digest: [u8; 16] = Default::default();
 
-            let file_data = std::fs::symlink_metadata(&file.0.path).unwrap();
+            let file_data = std::fs::symlink_metadata(&file.0.path)?;
             if !file_data.is_file() {
-                panic!("Unsupported local file type for calculating digest ({:?})", file_data.file_type());
+                bail!("Unsupported local file type for calculating digest ({:?})", file_data.file_type());
             }
 
             match file.1 {
-                DigestType::Binary => compute_digest_binary(file.0, &mut hasher).unwrap(),
-                DigestType::Text => compute_digest_text(file.0, &mut hasher).unwrap(),
-                DigestType::Utf8 => compute_digest_utf8(file.0, &mut hasher).unwrap(),
+                DigestType::Binary => compute_digest_binary(file.0, &mut hasher)?,
+                DigestType::Text => compute_digest_text(file.0, &mut hasher)?,
+                DigestType::Utf8 => compute_digest_utf8(file.0, &mut hasher)?,
             }
 
             digest.copy_from_slice(&hasher.finalize()[..16]);
-            (file.0, digest, false)
+            Ok((file.0, digest, false))
         })
         .collect();
+
+    let results = results?;
 
     // Update cache
     for result in &results {
@@ -917,7 +889,7 @@ fn parallel_compute_digests<'a>(
         }
     }
 
-    results
+    Ok(results)
 }
 
 /// Performs reconcile for a single directory. Ties everything else together.
@@ -1169,20 +1141,23 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     );
 
     // Compute digests to see if we need to open files for edit.
-    if check_edit.len() > 0 {
+    if !check_edit.is_empty() {
         println!("   Checking digests for {} files.", check_edit.len());
 
         let start_time = Instant::now();
         let mut total_size = 0;
 
-        let results = parallel_compute_digests(check_edit, cache);
+        let results = parallel_compute_digests(check_edit, cache)?;
         for result in results {
             if !result.2 {
-                total_size = total_size + result.0.size;
+                total_size += result.0.size;
             }
 
-            let record = depot.get_client_record(&result.0.path_lower).unwrap();
-            if result.1 != record.digest.unwrap() {
+            let record = depot.get_client_record(&result.0.path_lower)
+                .ok_or_else(|| anyhow!("Failed to find depot record for {}", result.0.path))?;
+            let expected_digest = record.digest
+                .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))?;
+            if result.1 != expected_digest {
                 do_edit.push(result.0.path.clone());
 
                 if options.verbose {
@@ -1201,7 +1176,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Compute digests to see if we need to revert files open for edit.
-    if check_revert_edit.len() > 0 {
+    if !check_revert_edit.is_empty() {
         println!(
             "   Checking digests for {} files.",
             check_revert_edit.len()
@@ -1210,14 +1185,17 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
         let start_time = Instant::now();
         let mut total_size = 0;
 
-        let results = parallel_compute_digests(check_revert_edit, cache);
+        let results = parallel_compute_digests(check_revert_edit, cache)?;
         for result in results {
             if !result.2 {
-                total_size = total_size + result.0.size;
+                total_size += result.0.size;
             }
 
-            let record = depot.get_client_record(&result.0.path_lower).unwrap();
-            if result.1 == record.digest.unwrap() {
+            let record = depot.get_client_record(&result.0.path_lower)
+                .ok_or_else(|| anyhow!("Failed to find depot record for {}", result.0.path))?;
+            let expected_digest = record.digest
+                .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))?;
+            if result.1 == expected_digest {
                 do_revert_edit.push(result.0.path.clone());
 
                 if options.verbose {
@@ -1236,7 +1214,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Compute digests to see if we need to revert deletes or reopen files for edit.
-    if check_revert_delete_or_reopen_edit.len() > 0 {
+    if !check_revert_delete_or_reopen_edit.is_empty() {
         println!(
             "   Checking digests for {} files.",
             check_revert_delete_or_reopen_edit.len()
@@ -1245,14 +1223,17 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
         let start_time = Instant::now();
         let mut total_size = 0;
 
-        let results = parallel_compute_digests(check_revert_delete_or_reopen_edit, cache);
+        let results = parallel_compute_digests(check_revert_delete_or_reopen_edit, cache)?;
         for result in results {
             if !result.2 {
-                total_size = total_size + result.0.size;
+                total_size += result.0.size;
             }
 
-            let record = depot.get_client_record(&result.0.path_lower).unwrap();
-            if result.1 == record.digest.unwrap() {
+            let record = depot.get_client_record(&result.0.path_lower)
+                .ok_or_else(|| anyhow!("Failed to find depot record for {}", result.0.path))?;
+            let expected_digest = record.digest
+                .ok_or_else(|| anyhow!("Missing digest for {}", record.depot_file))?;
+            if result.1 == expected_digest {
                 do_revert_delete.push(result.0.path.clone());
 
                 if options.verbose {
@@ -1312,7 +1293,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     let start_time = Instant::now();
 
     // Add
-    if do_add.len() > 0 {
+    if !do_add.is_empty() {
         println!(
                 "      Adding {} files in workspace, not in depot or deleted at have revision, but not checked out for add.",
                 do_add.len()
@@ -1331,7 +1312,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Edit
-    if do_edit.len() > 0 {
+    if !do_edit.is_empty() {
         println!(
                 "      Editing {} files in workspace, changed from have revision, but not checked out for edit.",
                 do_edit.len()
@@ -1350,7 +1331,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Reopen edit
-    if do_reopen_edit.len() > 0 {
+    if !do_reopen_edit.is_empty() {
         println!(
                 "      Revert+Editing {} files in workspace, changed from have revision, but checked out for delete.",
                 do_reopen_edit.len()
@@ -1371,7 +1352,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Delete
-    if do_delete.len() > 0 {
+    if !do_delete.is_empty() {
         println!(
             "      Deleting {} files not in workspace, but not checked out for delete.",
             do_delete.len()
@@ -1390,7 +1371,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Reopen delete
-    if do_reopen_delete.len() > 0 {
+    if !do_reopen_delete.is_empty() {
         println!(
             "      Revert+Deleting {} files not in workspace, but checked out for edit.",
             do_reopen_delete.len()
@@ -1411,7 +1392,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Revert add
-    if do_revert_add.len() > 0 {
+    if !do_revert_add.is_empty() {
         println!(
             "      Reverting {} files not in workspace, but checked out for add.",
             do_revert_add.len()
@@ -1430,7 +1411,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Revert edit
-    if do_revert_edit.len() > 0 {
+    if !do_revert_edit.is_empty() {
         println!(
                 "      Reverting {} files in workspace, not changed from have revision, but checked out for edit.",
                 do_revert_edit.len()
@@ -1449,7 +1430,7 @@ async fn reconcile_dir(options: &Options, work_dir: &str, cache: &mut WorkspaceC
     }
 
     // Revert delete
-    if do_revert_delete.len() > 0 {
+    if !do_revert_delete.is_empty() {
         println!(
                 "      Reverting {} files in workspace, not changed from have revision, but checked out for delete.",
                 do_revert_delete.len()
@@ -1496,10 +1477,13 @@ fn main() -> Result<()> {
         options.workspace = env::var("P4CLIENT").ok();
     }
 
-    match &options.workspace {
+    let workspace_name = match &options.workspace {
         None => bail!("No workspace found, use -w or set P4CLIENT."),
-        Some(name) => println!("Using workspace \"{}\".", name),
-    }
+        Some(name) => {
+            println!("Using workspace \"{}\".", name);
+            name.as_str()
+        }
+    };
 
     // Changelist input
     match options.changelist {
@@ -1517,21 +1501,27 @@ fn main() -> Result<()> {
     // Load digest cache
     if let Some(proj_dirs) = ProjectDirs::from("com", "",  "FastReconcile") {
         let config = bincode::config::standard();
-        let cache_path = proj_dirs.cache_dir().join("digests_".to_owned() + &options.workspace.clone().unwrap() + ".bin");
+        let cache_path = proj_dirs.cache_dir().join("digests_".to_owned() + workspace_name + ".bin");
 
         if cache_path.exists() {
             println!("Loading cache from {}.", cache_path.display());
-            let mut cache_file = File::open(cache_path)?;
-
-            let mut buffer = Vec::new();
-            cache_file.read_to_end(&mut buffer)?;
-
-            let (decoded, _) : (WorkspaceCache, usize) = bincode::decode_from_slice(&buffer[..], config)?;
-
-            cache = decoded;
-            cache.out_of_date = false;
-
-            println!("    Loaded {} cached digests.", cache.file_map.len());
+            match (|| -> Result<WorkspaceCache> {
+                let mut cache_file = File::open(&cache_path)?;
+                let mut buffer = Vec::new();
+                cache_file.read_to_end(&mut buffer)?;
+                let (decoded, _) : (WorkspaceCache, usize) = bincode::decode_from_slice(&buffer[..], config)?;
+                Ok(decoded)
+            })() {
+                Ok(decoded) => {
+                    cache = decoded;
+                    cache.out_of_date = false;
+                    println!("    Loaded {} cached digests.", cache.file_map.len());
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to load cache ({}), will rebuild from scratch", e);
+                    // Cache remains empty, will be rebuilt
+                }
+            }
         }
     }
 
@@ -1543,11 +1533,15 @@ fn main() -> Result<()> {
         if original_path.starts_with("//") {
             let args = ["-Mj", "-Ztag", "where"];
             let paths = [original_path.to_owned()];
-            let result = task::block_on(run_p4_command_slice(&options, &env::current_dir().unwrap().to_string_lossy(), &args, &paths, false))?;
+            let current_dir = env::current_dir()
+                .map_err(|e| anyhow!("Failed to get current directory: {}", e))?;
+            let result = task::block_on(run_p4_command_slice(&options, &current_dir.to_string_lossy(), &args, &paths, false))?;
             for record_result in result.into_iter().map(|line| serde_json::from_str::<serde_json::Value>(&line)) {
                 let record = record_result?;
                 if record["depotFile"].as_str() == Some(original_path) {
-                    path = record["path"].as_str().unwrap().to_owned();
+                    path = record["path"].as_str()
+                        .ok_or_else(|| anyhow!("Missing 'path' field in p4 where response for {}", original_path))?
+                        .to_owned();
                     break
                 }
             }
@@ -1578,11 +1572,12 @@ fn main() -> Result<()> {
     if cache.out_of_date {
         if let Some(proj_dirs) = ProjectDirs::from("com", "",  "FastReconcile") {
             let config = bincode::config::standard();
-            let cache_path = proj_dirs.cache_dir().join("digests_".to_owned() + &options.workspace.clone().unwrap() + ".bin");
+            let cache_path = proj_dirs.cache_dir().join("digests_".to_owned() + workspace_name + ".bin");
 
             println!("Saving cache to {}.", cache_path.display());
 
-            let prefix = cache_path.parent().unwrap();
+            let prefix = cache_path.parent()
+                .ok_or_else(|| anyhow!("Failed to get parent directory of cache path"))?;
             create_dir_all(prefix)?;
 
             let cache_file = File::create(cache_path)?;

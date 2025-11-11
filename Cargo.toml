@@ -10,7 +10,7 @@ clap = { version = "4.5.51", features = ["derive"] }
 walkdir = "2.5.0"
 md-5 = "0.11.0-rc.3"
 rayon = "1.11.0"
-smol = "2.0"
+async-global-executor = "2.4.1"
 async-process = "2.5.0"
 futures = "0.3.31"
 hex = "0.4.3"
