@@ -1026,7 +1026,7 @@ fn is_unchanged_since_sync(file: &WorkspaceFile, have_records: &HashMap<String, 
                 Err(_) => return false,
             };
 
-            return file_time_secs <= sync_time;
+            return file_time_secs.abs_diff(sync_time) <= 1;
         }
     }
     false
